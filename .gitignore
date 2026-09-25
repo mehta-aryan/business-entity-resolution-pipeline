@@ -1,0 +1,24 @@
+# Challenge data
+student_resource/dataset/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Generated/cache files
+*.pkl
+*.joblib
+*.log
+.cache/
+__pycache__/
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# IDE
+.vscode/
+.idea/
