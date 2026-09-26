@@ -223,12 +223,14 @@ class Blocker:
                     self.idx[f"an:{country}:{num}"].append(eid)
         
         # Prune mega-blocks (they dominate runtime without adding recall)
+        import random
+        rng = random.Random(42)
         pruned = 0
         for k in list(self.idx):
             if len(self.idx[k]) > self.max_block:
                 pruned += 1
-                del self.idx[k]
-        print(f"    keys: {len(self.idx):,}, pruned {pruned:,} blocks > {self.max_block}")
+                self.idx[k] = rng.sample(self.idx[k], self.max_block)
+        print(f"    keys: {len(self.idx):,}, sampled {pruned:,} blocks > {self.max_block}")
 
         # ---- TF-IDF per country (for name similarity) ----
         print("  Building TF-IDF indices ...", flush=True)
@@ -744,23 +746,32 @@ def run_train(sample_frac=1.0):
     probs = model.predict(X_vc)
 
     # Fine-grained threshold search
-    best_f05, best_thr = 0, 0.5
+    best_f05, best_thr, best_k = 0, 0.5, 3
     for thr in np.arange(0.05, 0.98, 0.01):
-        pred_d = defaultdict(set)
-        for sid in val_ids:
-            pred_d[sid] = set()
+        # group scores per sid
+        scored_d = defaultdict(list)
         for i, (sid, cid) in enumerate(val_all_pairs):
             if probs[i] >= thr:
-                pred_d[sid].add(cid)
-        f = macro_f05(pred_d, gt_dict, list(val_ids))
-        if f > best_f05:
-            best_f05, best_thr = f, thr
+                scored_d[sid].append((probs[i], cid))
+        
+        for k in [3, 5, 8, 12]:
+            pred_d = defaultdict(set)
+            for sid in val_ids:
+                pred_d[sid] = set()
+            for sid, cands_list in scored_d.items():
+                cands_list.sort(reverse=True, key=lambda x: x[0])
+                for _, cid in cands_list[:k]:
+                    pred_d[sid].add(cid)
+            f = macro_f05(pred_d, gt_dict, list(val_ids))
+            if f > best_f05:
+                best_f05, best_thr, best_k = f, thr, k
 
     print(f"\n  Best threshold: {best_thr:.2f}")
+    print(f"  Best K: {best_k}")
     print(f"  Validation F_0.5:  {best_f05:.4f}")
 
     # Save
-    artefact = {'model': model, 'threshold': best_thr, 'features': FEATURE_NAMES,
+    artefact = {'model': model, 'threshold': best_thr, 'k_cap': best_k, 'features': FEATURE_NAMES,
                 'blocker_cfg': {'max_block': blocker.max_block, 'tfidf_k': blocker.tfidf_k}}
     path = os.path.join(MODEL_DIR, 'model.pkl')
     with open(path, 'wb') as f:
@@ -805,7 +816,8 @@ def run_test(sample_frac=1.0):
         artefact = pickle.load(f)
     model = artefact['model']
     thr   = artefact['threshold']
-    print(f"  Model loaded, threshold={thr:.2f}")
+    k_cap = artefact.get('k_cap', 5)
+    print(f"  Model loaded, threshold={thr:.2f}, k_cap={k_cap}")
 
     # Lookups
     s1_lookup  = build_lookup(s1)
@@ -825,7 +837,7 @@ def run_test(sample_frac=1.0):
             all_pairs.append((sid, c))
     print(f"  Total pairs: {len(all_pairs):,}")
 
-    matches = defaultdict(set)
+    matches_scored = defaultdict(list)
     batch = 500_000
     for start in range(0, len(all_pairs), batch):
         end = min(start + batch, len(all_pairs))
@@ -837,9 +849,15 @@ def run_test(sample_frac=1.0):
             p = model.predict(X)
             for i, (sid, cid) in enumerate(valid_chunk):
                 if p[i] >= thr:
-                    matches[sid].add(cid)
+                    matches_scored[sid].append((p[i], cid))
         if start % (batch * 3) == 0 and start:
             print(f"    {start:,}/{len(all_pairs):,}", flush=True)
+
+    matches = defaultdict(set)
+    for sid, cands_list in matches_scored.items():
+        cands_list.sort(reverse=True, key=lambda x: x[0])
+        for _, cid in cands_list[:k_cap]:
+            matches[sid].add(cid)
 
     # Write outputs
     print("\nWriting outputs ...")
