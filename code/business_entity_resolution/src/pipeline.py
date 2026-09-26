@@ -596,12 +596,28 @@ def run_train(sample_frac=1.0):
                 val_f05=best_f05, threshold=best_thr)
 
 
-def run_test():
+def run_test(sample_frac=1.0):
     print("=" * 80)
     print("TEST INFERENCE")
     print("=" * 80)
 
     s1, s2, s3 = load_sources(TEST_DIR, 'test')
+
+    if sample_frac < 1.0:
+        rng = np.random.RandomState(42)
+        n = int(len(s1) * sample_frac)
+        keep = set(rng.choice(s1['entity_id'].values, n, replace=False))
+        s1 = s1[s1['entity_id'].isin(keep)].reset_index(drop=True)
+        # No ground truth on test -- just take a matching random slice of S2/S3
+        # so blocking/TF-IDF build time shrinks too, not just S1.
+        n2 = min(len(s2), max(n * 5, 500))
+        n3 = min(len(s3), max(n * 5, 500))
+        s2 = s2[s2['entity_id'].isin(rng.choice(s2['entity_id'].values, n2, replace=False))].reset_index(drop=True)
+        s3 = s3[s3['entity_id'].isin(rng.choice(s3['entity_id'].values, n3, replace=False))].reset_index(drop=True)
+        print(f"  [TEST SAMPLE MODE] S1={len(s1):,}  S2={len(s2):,}  S3={len(s3):,}")
+        print("  NOTE: output from this mode is NOT a valid submission "
+              "(missing S1 entities) -- smoke-test only.")
+
     s1 = preprocess(s1)
     s2 = preprocess(s2)
     s3 = preprocess(s3)
@@ -679,7 +695,12 @@ def main():
     ap.add_argument('--mode', choices=['train','test','full'], default='full')
     ap.add_argument('--sample', type=float, default=1.0,
                     help='Fraction of training data (for fast dev)')
+    ap.add_argument('--test-sample', type=float, default=None,
+                    help='Fraction of test data (for fast dev). '
+                         'Defaults to --sample if not given. '
+                         'NOTE: output is NOT a valid submission when < 1.0.')
     args = ap.parse_args()
+    test_sample = args.test_sample if args.test_sample is not None else args.sample
 
     if args.mode in ('train', 'full'):
         res = run_train(args.sample)
@@ -688,7 +709,7 @@ def main():
             print(f"  {k}: {v}")
 
     if args.mode in ('test', 'full'):
-        run_test()
+        run_test(test_sample)
 
 
 if __name__ == '__main__':
