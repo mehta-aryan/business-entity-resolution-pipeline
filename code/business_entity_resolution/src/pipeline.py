@@ -78,6 +78,7 @@ def norm_addr(text):
 
 _ZIP_US = re.compile(r'\b(\d{5})(?:-\d{4})?\b')
 _PIN_IN = re.compile(r'\b(\d{6})\b')
+_ZIP_FR = re.compile(r'\b(\d{5})\b')
 
 def extract_postal(addr, country=''):
     if not isinstance(addr, str):
@@ -85,6 +86,9 @@ def extract_postal(addr, country=''):
     country_l = country.lower() if isinstance(country, str) else ''
     if country_l == 'india':
         m = _PIN_IN.search(addr)
+        return m.group(1) if m else ''
+    if country_l == 'france':
+        m = _ZIP_FR.search(addr)
         return m.group(1) if m else ''
     m = _ZIP_US.search(addr)
     if m:
@@ -114,12 +118,19 @@ def soundex(name):
 _STOP = frozenset({'the','a','an','of','and','in','for','to','on','at','by',
                     'de','la','le','les','du','des','et','en',
                     'private','limited','pvt','ltd','llc','inc','corp',
-                    'company','co','group','services','enterprise','enterprises'})
+                    'company','co','group','services','enterprise','enterprises',
+                    'near','opposite','behind','next','nagar','road','street',
+                    'avenue','floor','apartment','suite','building','tower',
+                    'block','sector','phase','plot','no'})
 
 def name_tokens(name_norm):
     """Significant tokens for blocking."""
     return [t for t in name_norm.split() if t not in _STOP and len(t) > 1]
 
+
+def extract_addr_numbers(addr_norm):
+    """Extract numeric tokens from normalized address."""
+    return set(re.findall(r'\d+', addr_norm))
 
 ###############################################################################
 # PREPROCESSING — add all derived columns
@@ -133,12 +144,21 @@ def preprocess(df):
     df['addr_norm'] = df['business_address'].fillna('').map(norm_addr)
     df['postal'] = df.apply(lambda r: extract_postal(r['business_address'], r['country']), axis=1)
     
-    # Blocking keys
+    # Blocking keys — ALL significant tokens, not just the first
     nts = df['name_norm'].map(name_tokens)
+    df['name_toks'] = nts  # list of significant tokens
     df['name_first'] = nts.map(lambda t: t[0] if t else '')
     df['name_pre3'] = df['name_first'].str[:3]
     df['name_sx'] = df['name_first'].map(soundex)
     
+    # All-token soundex codes for multi-token phonetic blocking
+    df['all_sx'] = nts.map(lambda toks: list(set(soundex(t) for t in toks if t)))
+    
+    # Address numbers for address-based blocking
+    df['addr_nums'] = df['addr_norm'].map(extract_addr_numbers)
+    
+    # Country normalization (handle potential inconsistencies)
+    df['country_norm'] = df['country'].fillna('').str.strip().str.lower()
     
     print(f"done in {time.time()-t0:.0f}s")
     return df
@@ -148,9 +168,20 @@ def preprocess(df):
 # BLOCKING
 ###############################################################################
 class Blocker:
-    """Multi-key inverted-index blocker + optional TF-IDF ANN per country."""
+    """Multi-key inverted-index blocker + TF-IDF ANN.
+    
+    Key improvements over original:
+    - Multi-token blocking (all significant tokens, not just first)
+    - Country-agnostic keys alongside country-scoped ones
+    - Phonetic codes on all tokens
+    - Address number blocking
+    - Higher max_block tolerance
+    - Higher TF-IDF k
+    """
 
-    def __init__(self, max_block=500, tfidf_k=10):
+    MAX_CANDS_PER_ENTITY = 500  # cap candidates per S1 entity for runtime
+
+    def __init__(self, max_block=2000, tfidf_k=20):
         self.max_block = max_block
         self.tfidf_k = tfidf_k
 
@@ -159,16 +190,39 @@ class Blocker:
         t0 = time.time()
         print("  Building inverted index on S2/S3 ...", flush=True)
         self.idx = defaultdict(list)
-        for eid, country, postal, pre3, sx in zip(
-                s2s3['entity_id'], s2s3['country'],
-                s2s3['postal'], s2s3['name_pre3'], s2s3['name_sx']):
+        # Store name lookup for candidate cap pre-filtering
+        self._s23_names = dict(zip(s2s3['entity_id'], s2s3['name_norm']))
+        
+        for eid, country, postal, toks, all_sx, addr_nums in zip(
+                s2s3['entity_id'], s2s3['country_norm'],
+                s2s3['postal'], s2s3['name_toks'],
+                s2s3['all_sx'], s2s3['addr_nums']):
+            
+            # 1. Postal code blocking (country-scoped AND country-agnostic)
             if postal:
-                self.idx[f"cp:{country}:{postal}"].append(eid)
-            if pre3:
-                self.idx[f"cn:{country}:{pre3}"].append(eid)
-            if sx:
-                self.idx[f"cs:{country}:{sx}"].append(eid)
-        # prune mega-blocks  (they'd dominate runtime without adding recall)
+                self.idx[f"p:{postal}"].append(eid)
+            
+            # 2. Name token blocking — every significant token as a key
+            #    (country-scoped to keep block sizes manageable for common tokens)
+            for tok in toks:
+                if len(tok) >= 3:
+                    self.idx[f"nt:{country}:{tok}"].append(eid)
+                # Country-agnostic prefix (4-char to limit block sizes at scale)
+                if len(tok) >= 4:
+                    self.idx[f"np:{tok[:4]}"].append(eid)
+            
+            # 3. Soundex blocking on all tokens (country-scoped)
+            for sx in all_sx:
+                if sx:
+                    self.idx[f"sx:{country}:{sx}"].append(eid)
+            
+            # 4. Address number blocking — specific street/building numbers
+            #    (only for "distinctive" numbers, skip very short ones like "1", "2")
+            for num in addr_nums:
+                if len(num) >= 3:  # 3+ digit numbers are more distinctive
+                    self.idx[f"an:{country}:{num}"].append(eid)
+        
+        # Prune mega-blocks (they dominate runtime without adding recall)
         pruned = 0
         for k in list(self.idx):
             if len(self.idx[k]) > self.max_block:
@@ -176,16 +230,16 @@ class Blocker:
                 del self.idx[k]
         print(f"    keys: {len(self.idx):,}, pruned {pruned:,} blocks > {self.max_block}")
 
-        # ---- TF-IDF per country ----
+        # ---- TF-IDF per country (for name similarity) ----
         print("  Building TF-IDF indices ...", flush=True)
         self.tfidf = {}
-        for ctry in s2s3['country'].unique():
-            mask = s2s3['country'] == ctry
+        for ctry in s2s3['country_norm'].unique():
+            mask = s2s3['country_norm'] == ctry
             sub = s2s3.loc[mask]
             if len(sub) == 0:
                 continue
             vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(3,4),
-                                  max_features=80_000, sublinear_tf=True, dtype=np.float32)
+                                  max_features=100_000, sublinear_tf=True, dtype=np.float32)
             mat = vec.fit_transform(sub['name_norm'].values)
             self.tfidf[ctry] = (vec, mat, sub['entity_id'].values)
             print(f"    {ctry}: {len(sub):,} records, TF-IDF shape {mat.shape}")
@@ -199,24 +253,53 @@ class Blocker:
         n = len(s1)
         cands = {}
 
-        # Step 1 — inverted index
-        for eid, country, postal, pre3, sx in zip(
-                s1['entity_id'], s1['country'],
-                s1['postal'], s1['name_pre3'], s1['name_sx']):
+        # Step 1 — inverted index lookups
+        for eid, country, postal, toks, all_sx, addr_nums in zip(
+                s1['entity_id'], s1['country_norm'],
+                s1['postal'], s1['name_toks'],
+                s1['all_sx'], s1['addr_nums']):
             hits = set()
-            for key in (f"cp:{country}:{postal}" if postal else None,
-                        f"cn:{country}:{pre3}" if pre3 else None,
-                        f"cs:{country}:{sx}" if sx else None):
-                if key and key in self.idx:
+            
+            # Postal code lookup (country-agnostic)
+            if postal:
+                key = f"p:{postal}"
+                if key in self.idx:
                     hits.update(self.idx[key])
+            
+            # Name token lookup — all significant tokens
+            for tok in toks:
+                if len(tok) >= 3:
+                    key = f"nt:{country}:{tok}"
+                    if key in self.idx:
+                        hits.update(self.idx[key])
+                # Country-agnostic prefix fallback (4-char)
+                if len(tok) >= 4:
+                    key = f"np:{tok[:4]}"
+                    if key in self.idx:
+                        hits.update(self.idx[key])
+            
+            # Soundex lookup on all tokens
+            for sx in all_sx:
+                if sx:
+                    key = f"sx:{country}:{sx}"
+                    if key in self.idx:
+                        hits.update(self.idx[key])
+            
+            # Address number lookup
+            for num in addr_nums:
+                if len(num) >= 3:
+                    key = f"an:{country}:{num}"
+                    if key in self.idx:
+                        hits.update(self.idx[key])
+            
             cands[eid] = hits
 
         # Step 2 — TF-IDF top-k per country batch
-        for ctry in s1['country'].unique():
+        for ctry in s1['country_norm'].unique():
             if ctry not in self.tfidf:
                 continue
             vec, mat, ids23 = self.tfidf[ctry]
-            mask = s1['country'] == ctry
+            mask = s1['country_norm'] == ctry
             sub = s1.loc[mask]
             eids = sub['entity_id'].values
             names = sub['name_norm'].values
@@ -239,6 +322,30 @@ class Blocker:
                 if start % (batch*20) == 0 and start:
                     print(f"    TF-IDF {ctry} {start:,}/{len(sub):,}", flush=True)
 
+        # Per-entity candidate cap: if too many candidates, keep the most
+        # promising ones using a cheap character-overlap pre-filter (much
+        # faster than fuzz.ratio for thousands of candidates).
+        s1_names = dict(zip(s1['entity_id'], s1['name_norm']))
+        capped = 0
+        for eid in list(cands):
+            if len(cands[eid]) > self.MAX_CANDS_PER_ENTITY:
+                capped += 1
+                nn1 = s1_names.get(eid, '')
+                nn1_set = set(nn1.split())
+                scored = []
+                for cid in cands[eid]:
+                    nn2 = self._s23_names.get(cid, '')
+                    nn2_set = set(nn2.split())
+                    # Token overlap score (cheap approximation of Jaccard)
+                    inter = len(nn1_set & nn2_set)
+                    union = len(nn1_set | nn2_set)
+                    score = inter / max(union, 1)
+                    scored.append((score, cid))
+                scored.sort(reverse=True)
+                cands[eid] = set(cid for _, cid in scored[:self.MAX_CANDS_PER_ENTITY])
+        if capped:
+            print(f"    Capped {capped:,} entities to {self.MAX_CANDS_PER_ENTITY} candidates")
+
         # Ensure every S1 entity has an entry
         for eid in s1['entity_id'].values:
             cands.setdefault(eid, set())
@@ -246,22 +353,50 @@ class Blocker:
         total = sum(len(v) for v in cands.values())
         nonempty = sum(1 for v in cands.values() if v)
         elapsed = time.time() - t0
-        print(f"  Candidates: {total:,} pairs, {nonempty:,}/{n:,} S1 with >=1 cand, {elapsed:.0f}s")
+        avg_cands = total / max(n, 1)
+        print(f"  Candidates: {total:,} pairs, {nonempty:,}/{n:,} S1 with >=1 cand, avg={avg_cands:.1f}/entity, {elapsed:.0f}s")
         return cands
 
 
 ###############################################################################
-# FEATURE COMPUTATION  (vectorized with rapidfuzz)
+# FEATURE COMPUTATION
 ###############################################################################
 FEATURE_NAMES = [
-    'name_exact', 'name_lev', 'name_jaro', 'name_token_sort',
-    'name_jaccard', 'name_containment', 'name_3gram_jaccard',
-    'name_prefix_ratio', 'name_soundex_match', 'name_len_ratio',
-    'addr_lev', 'addr_jaccard', 'addr_containment',
-    'addr_num_jaccard', 'postal_exact', 'postal_both_present',
-    'addr_len_ratio', 'addr2_empty',
-    'country_match',
-    'name_addr_prod', 'name_lev_addr_lev_prod',
+    # Name similarity features (0-13)
+    'name_exact',             # 0:  exact match after normalization
+    'name_lev',               # 1:  fuzz.ratio (normalized levenshtein)
+    'name_partial',           # 2:  fuzz.partial_ratio
+    'name_token_sort',        # 3:  fuzz.token_sort_ratio
+    'name_token_set',         # 4:  fuzz.token_set_ratio
+    'name_jaccard',           # 5:  token jaccard
+    'name_containment_s1',    # 6:  |intersection|/|s1_tokens| — s1 tokens covered
+    'name_containment_s23',   # 7:  |intersection|/|s23_tokens| — s23 tokens covered
+    'name_3gram_jaccard',     # 8:  character 3-gram jaccard
+    'name_prefix_ratio',      # 9:  common prefix length / max length
+    'name_soundex_match',     # 10: soundex of first token matches
+    'name_len_ratio',         # 11: min(len)/max(len)
+    'name_first_exact',       # 12: first significant token exact match
+    'name_len_diff',          # 13: abs length difference (raw)
+    
+    # Address similarity features (14-24)
+    'addr_lev',               # 14: fuzz.ratio on address
+    'addr_token_sort',        # 15: fuzz.token_sort_ratio on address
+    'addr_jaccard',           # 16: token jaccard on address
+    'addr_containment',       # 17: token containment on address
+    'addr_num_jaccard',       # 18: numeric token jaccard
+    'addr_num_overlap',       # 19: count of overlapping numeric tokens
+    'postal_exact',           # 20: postal code exact match
+    'postal_both_present',    # 21: both have postal codes
+    'postal_prefix3',         # 22: first 3 digits of postal match
+    'addr_len_ratio',         # 23: address length ratio
+    'addr2_empty',            # 24: s23 address is empty
+    
+    # Cross-field features (25-29)
+    'country_match',          # 25: country exact match
+    'name_addr_prod',         # 26: name_jaccard * addr_jaccard
+    'name_lev_addr_lev_prod', # 27: name_lev * addr_lev
+    'name_token_set_addr',    # 28: name_token_set * addr_lev
+    'max_name_sim',           # 29: max of name_lev, name_token_sort, name_token_set
 ]
 
 def _jaccard(s1, s2):
@@ -276,7 +411,8 @@ def compute_features_vec(s1_rows, s23_rows):
     Returns np.ndarray of shape (n, num_features).
     """
     n = len(s1_rows)
-    X = np.zeros((n, len(FEATURE_NAMES)), dtype=np.float32)
+    nf = len(FEATURE_NAMES)
+    X = np.zeros((n, nf), dtype=np.float32)
 
     for i in range(n):
         r1 = s1_rows[i]
@@ -287,52 +423,71 @@ def compute_features_vec(s1_rows, s23_rows):
         an1 = r1['addr_norm']
         an2 = r2['addr_norm']
 
-        # Name features
-        X[i, 0] = 1.0 if nn1 == nn2 else 0.0                         # name_exact
-        X[i, 1] = fuzz.ratio(nn1, nn2) / 100.0                       # name_lev (normalised)
-        X[i, 2] = fuzz.partial_ratio(nn1, nn2) / 100.0               # name_jaro (partial)
-        X[i, 3] = fuzz.token_sort_ratio(nn1, nn2) / 100.0            # name_token_sort
+        # ----- Name features -----
+        X[i, 0] = 1.0 if nn1 and nn2 and nn1 == nn2 else 0.0            # name_exact
+        X[i, 1] = fuzz.ratio(nn1, nn2) / 100.0                           # name_lev
+        X[i, 2] = fuzz.partial_ratio(nn1, nn2) / 100.0                   # name_partial
+        X[i, 3] = fuzz.token_sort_ratio(nn1, nn2) / 100.0                # name_token_sort
+        X[i, 4] = fuzz.token_set_ratio(nn1, nn2) / 100.0                 # name_token_set
 
-        toks1 = set(nn1.split())
-        toks2 = set(nn2.split())
-        X[i, 4] = _jaccard(toks1, toks2)                             # name_jaccard
-        X[i, 5] = len(toks1 & toks2) / max(len(toks1), 1)           # name_containment
+        toks1 = set(nn1.split()) if nn1 else set()
+        toks2 = set(nn2.split()) if nn2 else set()
+        X[i, 5] = _jaccard(toks1, toks2)                                 # name_jaccard
+        inter = len(toks1 & toks2) if toks1 and toks2 else 0
+        X[i, 6] = inter / max(len(toks1), 1)                             # name_containment_s1
+        X[i, 7] = inter / max(len(toks2), 1)                             # name_containment_s23
+
         ng1 = frozenset(nn1[k:k+3] for k in range(max(0, len(nn1)-2)))
         ng2 = frozenset(nn2[k:k+3] for k in range(max(0, len(nn2)-2)))
-        X[i, 6] = _jaccard(ng1, ng2)                                # name_3gram_jaccard
+        X[i, 8] = _jaccard(ng1, ng2)                                     # name_3gram_jaccard
 
         ml = max(len(nn1), len(nn2), 1)
         pfx = 0
         for c1, c2 in zip(nn1, nn2):
             if c1 != c2: break
             pfx += 1
-        X[i, 7] = pfx / ml                                           # name_prefix_ratio
-        X[i, 8] = 1.0 if r1['name_sx'] and r1['name_sx'] == r2['name_sx'] else 0.0  # soundex
-        X[i, 9] = min(len(nn1), len(nn2)) / max(len(nn1), len(nn2), 1)  # name_len_ratio
+        X[i, 9] = pfx / ml                                               # name_prefix_ratio
+        X[i, 10] = 1.0 if r1.get('name_sx') and r1['name_sx'] == r2.get('name_sx','') else 0.0  # soundex
 
-        # Address features
-        X[i, 10] = fuzz.ratio(an1, an2) / 100.0                       # addr_lev
-        atoks1 = set(an1.split())
-        atoks2 = set(an2.split())
-        X[i, 11] = _jaccard(atoks1, atoks2)                           # addr_jaccard
-        X[i, 12] = len(atoks1 & atoks2) / max(len(atoks1), 1)        # addr_containment
+        ln1, ln2 = len(nn1), len(nn2)
+        X[i, 11] = min(ln1, ln2) / max(ln1, ln2, 1)                      # name_len_ratio
+
+        # First significant token exact match
+        ft1 = r1.get('name_first', '')
+        ft2 = r2.get('name_first', '')
+        X[i, 12] = 1.0 if ft1 and ft2 and ft1 == ft2 else 0.0           # name_first_exact
+        X[i, 13] = abs(ln1 - ln2)                                        # name_len_diff
+
+        # ----- Address features -----
+        X[i, 14] = fuzz.ratio(an1, an2) / 100.0                          # addr_lev
+        X[i, 15] = fuzz.token_sort_ratio(an1, an2) / 100.0               # addr_token_sort
+
+        atoks1 = set(an1.split()) if an1 else set()
+        atoks2 = set(an2.split()) if an2 else set()
+        X[i, 16] = _jaccard(atoks1, atoks2)                              # addr_jaccard
+        X[i, 17] = len(atoks1 & atoks2) / max(len(atoks1), 1)            # addr_containment
 
         nums1 = set(re.findall(r'\d+', an1))
         nums2 = set(re.findall(r'\d+', an2))
-        X[i, 13] = _jaccard(nums1, nums2)                             # addr_num_jaccard
+        X[i, 18] = _jaccard(nums1, nums2)                                # addr_num_jaccard
+        X[i, 19] = len(nums1 & nums2) if nums1 and nums2 else 0          # addr_num_overlap
 
-        p1, p2 = r1['postal'], r2['postal']
-        X[i, 14] = 1.0 if (p1 and p2 and p1 == p2) else 0.0          # postal_exact
-        X[i, 15] = 1.0 if (p1 and p2) else 0.0                       # postal_both_present
-        X[i, 16] = min(len(an1), len(an2)) / max(len(an1), len(an2), 1)  # addr_len_ratio
-        X[i, 17] = 1.0 if not an2 else 0.0                            # addr2_empty
+        p1, p2 = r1.get('postal', ''), r2.get('postal', '')
+        X[i, 20] = 1.0 if (p1 and p2 and p1 == p2) else 0.0             # postal_exact
+        X[i, 21] = 1.0 if (p1 and p2) else 0.0                           # postal_both_present
+        X[i, 22] = 1.0 if (p1 and p2 and len(p1)>=3 and len(p2)>=3
+                           and p1[:3] == p2[:3]) else 0.0                 # postal_prefix3
 
-        # Country match
-        X[i, 18] = 1.0 if r1['country'] == r2['country'] else 0.0
+        la1, la2 = len(an1), len(an2)
+        X[i, 23] = min(la1, la2) / max(la1, la2, 1)                      # addr_len_ratio
+        X[i, 24] = 1.0 if not an2 else 0.0                               # addr2_empty
 
-        # Interaction features
-        X[i, 19] = X[i, 4] * X[i, 11]                                 # name_addr_prod
-        X[i, 20] = X[i, 1] * X[i, 10]                                 # name_lev_addr_lev_prod
+        # ----- Cross-field features -----
+        X[i, 25] = 1.0 if r1.get('country_norm','') == r2.get('country_norm','') else 0.0
+        X[i, 26] = X[i, 5] * X[i, 16]                                    # name_addr_prod
+        X[i, 27] = X[i, 1] * X[i, 14]                                    # name_lev_addr_lev_prod
+        X[i, 28] = X[i, 4] * X[i, 14]                                    # name_token_set * addr_lev
+        X[i, 29] = max(X[i, 1], X[i, 3], X[i, 4])                        # max_name_sim
 
     return X
 
@@ -384,6 +539,7 @@ def load_gt(path):
 def build_lookup(df):
     """entity_id → row-dict lookup."""
     cols = ['entity_id','name_norm','addr_norm','postal','name_sx','country',
+            'country_norm','name_first',
             'business_name','business_address']
     recs = {}
     for vals in zip(*(df[c] for c in cols)):
@@ -392,8 +548,12 @@ def build_lookup(df):
     return recs
 
 
-def make_pairs_and_labels(s1_ids, cands, gt_dict, s23_lookup, neg_ratio=3, rng=None):
-    """Build (s1_id, s23_id, label) triples from candidates + ground truth."""
+def make_pairs_and_labels(s1_ids, cands, gt_dict, s23_lookup, neg_ratio=5, rng=None):
+    """Build (s1_id, s23_id, label) triples from candidates + ground truth.
+    
+    Includes ground-truth positives even when missed by blocking, so the
+    model sees hard positives during training.
+    """
     if rng is None:
         rng = np.random.RandomState(42)
     pairs, labels = [], []
@@ -401,15 +561,16 @@ def make_pairs_and_labels(s1_ids, cands, gt_dict, s23_lookup, neg_ratio=3, rng=N
         true = gt_dict.get(s1_id, set())
         c = cands.get(s1_id, set())
 
-        # positives: true matches that exist in s23_lookup
+        # Positives: ALL true matches that exist in s23_lookup
+        # (includes those missed by blocking — critical for learning hard cases)
         pos = [m for m in true if m in s23_lookup]
         for m in pos:
             pairs.append((s1_id, m))
             labels.append(1)
 
-        # negatives: from candidates minus true
+        # Negatives: from candidates minus true
         negs = [m for m in (c - true) if m in s23_lookup]
-        max_neg = max(len(pos) * neg_ratio, 3)
+        max_neg = max(len(pos) * neg_ratio, 5)
         if len(negs) > max_neg:
             negs = list(rng.choice(negs, max_neg, replace=False))
         for m in negs:
@@ -425,6 +586,10 @@ def featurize(pairs, s1_lookup, s23_lookup, batch_size=200_000):
     X = np.zeros((n, len(FEATURE_NAMES)), dtype=np.float32)
     valid_mask = np.ones(n, dtype=bool)
 
+    _empty = {'name_norm':'','addr_norm':'','postal':'','name_sx':'',
+              'country':'','country_norm':'','name_first':'',
+              'business_name':'','business_address':''}
+
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         s1_rows = []
@@ -435,10 +600,8 @@ def featurize(pairs, s1_lookup, s23_lookup, batch_size=200_000):
             r2 = s23_lookup.get(s23_id)
             if r1 is None or r2 is None:
                 valid_mask[i] = False
-                s1_rows.append({'name_norm':'','addr_norm':'','postal':'','name_sx':'',
-                                'country':'','business_name':'',
-                                'business_address':''})
-                s23_rows.append(s1_rows[-1])
+                s1_rows.append(_empty)
+                s23_rows.append(_empty)
             else:
                 s1_rows.append(r1)
                 s23_rows.append(r2)
@@ -496,7 +659,7 @@ def run_train(sample_frac=1.0):
     print(f"  Train S1: {len(train_ids):,}  Val S1: {len(val_ids):,}")
 
     # Blocking (on all S1 for recall measurement)
-    blocker = Blocker(max_block=500, tfidf_k=10)
+    blocker = Blocker(max_block=2000, tfidf_k=20)
     blocker.fit(s23)
     cands = blocker.transform(s1)
 
@@ -517,8 +680,8 @@ def run_train(sample_frac=1.0):
 
     # Build training + validation pairs
     print("\nBuilding train/val pairs ...")
-    tr_pairs, y_tr = make_pairs_and_labels(list(train_ids), cands, gt_dict, s23_lookup, neg_ratio=3)
-    vl_pairs, y_vl = make_pairs_and_labels(list(val_ids),   cands, gt_dict, s23_lookup, neg_ratio=3)
+    tr_pairs, y_tr = make_pairs_and_labels(list(train_ids), cands, gt_dict, s23_lookup, neg_ratio=5)
+    vl_pairs, y_vl = make_pairs_and_labels(list(val_ids),   cands, gt_dict, s23_lookup, neg_ratio=5)
     print(f"  Train: {len(tr_pairs):,} pairs  (pos={y_tr.sum():,}, neg={len(y_tr)-y_tr.sum():,})")
     print(f"  Val:   {len(vl_pairs):,} pairs  (pos={y_vl.sum():,}, neg={len(y_vl)-y_vl.sum():,})")
 
@@ -539,20 +702,22 @@ def run_train(sample_frac=1.0):
     params = {
         'objective': 'binary', 'metric': 'binary_logloss',
         'boosting_type': 'gbdt',
-        'num_leaves': 63, 'learning_rate': 0.05,
+        'num_leaves': 127, 'learning_rate': 0.03,
         'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 5,
-        'min_child_samples': 100, 'verbosity': -1, 'n_jobs': -1,
+        'min_child_samples': 50, 'verbosity': -1, 'n_jobs': -1,
+        'max_depth': -1,
+        'lambda_l1': 0.1, 'lambda_l2': 1.0,
         'scale_pos_weight': float((y_tr == 0).sum()) / max(float((y_tr == 1).sum()), 1),
     }
-    model = lgb.train(params, dtrain, num_boost_round=500,
+    model = lgb.train(params, dtrain, num_boost_round=1000,
                       valid_sets=[dval],
-                      callbacks=[lgb.early_stopping(30), lgb.log_evaluation(50)])
+                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)])
 
     # Feature importance
     imp = model.feature_importance(importance_type='gain')
     order = np.argsort(imp)[::-1]
     print("\nFeature importance (gain):")
-    for idx in order[:15]:
+    for idx in order[:20]:
         print(f"  {FEATURE_NAMES[idx]:30s}  {imp[idx]:.0f}")
 
     # ---- Threshold tuning on ALL validation candidates ----
@@ -562,15 +727,25 @@ def run_train(sample_frac=1.0):
         for c in cands.get(sid, set()):
             if c in s23_lookup:
                 val_all_pairs.append((sid, c))
+    
+    # Also include GT positives missed by blocking for comprehensive eval
+    val_gt_extra = []
+    for sid in val_ids:
+        for m in gt_dict.get(sid, set()):
+            if m in s23_lookup and m not in cands.get(sid, set()):
+                val_gt_extra.append((sid, m))
+    
     print(f"  Val candidate pairs: {len(val_all_pairs):,}")
+    print(f"  Val GT pairs missed by blocking: {len(val_gt_extra):,}")
 
     X_vc, m_vc = featurize(val_all_pairs, s1_lookup, s23_lookup)
     X_vc = X_vc[m_vc]
     val_all_pairs = [p for p, ok in zip(val_all_pairs, m_vc) if ok]
     probs = model.predict(X_vc)
 
+    # Fine-grained threshold search
     best_f05, best_thr = 0, 0.5
-    for thr in np.arange(0.10, 0.96, 0.02):
+    for thr in np.arange(0.05, 0.98, 0.01):
         pred_d = defaultdict(set)
         for sid in val_ids:
             pred_d[sid] = set()
