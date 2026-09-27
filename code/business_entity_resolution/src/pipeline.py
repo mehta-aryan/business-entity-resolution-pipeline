@@ -23,7 +23,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
-from rapidfuzz.distance import Levenshtein
+from rapidfuzz.distance import Levenshtein, JaroWinkler
 import lightgbm as lgb
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -196,7 +196,7 @@ class Blocker:
 
     MAX_CANDS_PER_ENTITY = 500  # cap candidates per S1 entity for runtime
 
-    def __init__(self, max_block=2000, tfidf_k=20):
+    def __init__(self, max_block=2000, tfidf_k=50):
         self.max_block = max_block
         self.tfidf_k = tfidf_k
 
@@ -225,6 +225,9 @@ class Blocker:
                 # Country-agnostic prefix (4-char to limit block sizes at scale)
                 if len(tok) >= 4:
                     self.idx[f"np:{tok[:4]}"].append(eid)
+                # Country-agnostic full token (5-char for high precision)
+                if len(tok) >= 5:
+                    self.idx[f"nt_global:{tok}"].append(eid)
             
             # 3. Soundex blocking on all tokens (country-scoped)
             for sx in all_sx:
@@ -292,6 +295,11 @@ class Blocker:
                 # Country-agnostic prefix fallback (4-char)
                 if len(tok) >= 4:
                     key = f"np:{tok[:4]}"
+                    if key in self.idx:
+                        hits.update(self.idx[key])
+                # Country-agnostic full token (5-char for high precision)
+                if len(tok) >= 5:
+                    key = f"nt_global:{tok}"
                     if key in self.idx:
                         hits.update(self.idx[key])
             
@@ -414,6 +422,9 @@ FEATURE_NAMES = [
     'name_lev_addr_lev_prod', # 27: name_lev * addr_lev
     'name_token_set_addr',    # 28: name_token_set * addr_lev
     'max_name_sim',           # 29: max of name_lev, name_token_sort, name_token_set
+    'name_jaro_winkler',      # 30: Jaro-Winkler on name
+    'addr_jaro_winkler',      # 31: Jaro-Winkler on address
+    'is_source2',             # 32: 1 if candidate is from S2, else 0
 ]
 
 # Slot indices for lookup tuples:
@@ -431,9 +442,10 @@ def _jaccard(s1, s2):
     inter = len(s1 & s2)
     return inter / (len(s1) + len(s2) - inter)
 
-def compute_features_vec(s1_rows, s23_rows):
+def compute_features_vec(s1_rows, s23_rows, s23_ids):
     """
     s1_rows, s23_rows: aligned lists of 6-tuples (same length).
+    s23_ids: list of s23_ids for the is_source2 feature.
     Each tuple: (name_norm, addr_norm, postal, name_sx, country_norm, name_first)
     Returns np.ndarray of shape (n, num_features).
     """
@@ -520,6 +532,9 @@ def compute_features_vec(s1_rows, s23_rows):
         X[i, 27] = X[i, 1] * X[i, 14]                                    # name_lev_addr_lev_prod
         X[i, 28] = X[i, 4] * X[i, 14]                                    # name_token_set * addr_lev
         X[i, 29] = max(X[i, 1], X[i, 3], X[i, 4])                        # max_name_sim
+        X[i, 30] = JaroWinkler.similarity(nn1, nn2) if nn1 and nn2 else 0.0
+        X[i, 31] = JaroWinkler.similarity(an1, an2) if an1 and an2 else 0.0
+        X[i, 32] = 1.0 if s23_ids[i].startswith('S2-') else 0.0
 
     return X
 
@@ -678,7 +693,8 @@ def featurize(pairs, s1_lookup, s23_lookup, batch_size=200_000):
             else:
                 s1_rows.append(r1)
                 s23_rows.append(r2)
-        X[start:end] = compute_features_vec(s1_rows, s23_rows)
+        s23_ids_batch = [p[1] for p in pairs[start:end]]
+        X[start:end] = compute_features_vec(s1_rows, s23_rows, s23_ids_batch)
 
         if start and start % (batch_size * 5) == 0:
             print(f"    featurize {start:,}/{n:,}", flush=True)
@@ -704,9 +720,11 @@ def _featurize_store_to_memmap(pair_store, s1_lookup, s23_lookup,
     for batch in pair_store.iterate(batch_size):
         blen = len(batch)
         s1_rows, s23_rows = [], []
+        s23_ids_batch = []
         for k, (s1_id, s23_id) in enumerate(batch):
             r1 = s1_lookup.get(s1_id)
             r2 = s23_lookup.get(s23_id)
+            s23_ids_batch.append(s23_id)
             if r1 is None or r2 is None:
                 valid_mask[offset + k] = False
                 s1_rows.append(_empty)
@@ -714,7 +732,7 @@ def _featurize_store_to_memmap(pair_store, s1_lookup, s23_lookup,
             else:
                 s1_rows.append(r1)
                 s23_rows.append(r2)
-        mm[offset:offset + blen] = compute_features_vec(s1_rows, s23_rows)
+        mm[offset:offset + blen] = compute_features_vec(s1_rows, s23_rows, s23_ids_batch)
         offset += blen
         if offset % (batch_size * 5) == 0 and offset > 0:
             print(f"    featurize (memmap) {offset:,}/{total_pairs:,}", flush=True)
@@ -802,7 +820,7 @@ def run_train(sample_frac=1.0):
 
     # --- Blocker build BEFORE dropping Python-object columns ---
     # blocker.fit() is the only consumer of name_toks, all_sx, addr_nums.
-    blocker = Blocker(max_block=2000, tfidf_k=20)
+    blocker = Blocker(max_block=2000, tfidf_k=50)
     blocker.fit(s23)
 
     # --- RAM fix B: drop Python list/set columns from s23 after blocker.fit() ---
@@ -971,16 +989,16 @@ def run_train(sample_frac=1.0):
     params = {
         'objective': 'binary', 'metric': 'binary_logloss',
         'boosting_type': 'gbdt',
-        'num_leaves': 127, 'learning_rate': 0.03,
+        'num_leaves': 255, 'learning_rate': 0.03,
         'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 5,
-        'min_child_samples': 50, 'verbosity': -1, 'n_jobs': -1,
+        'min_child_samples': 20, 'verbosity': -1, 'n_jobs': -1,
         'max_depth': -1,
         'lambda_l1': 0.1, 'lambda_l2': 1.0,
         'scale_pos_weight': float((y_tr == 0).sum()) / max(float((y_tr == 1).sum()), 1),
     }
-    model = lgb.train(params, dtrain, num_boost_round=1000,
+    model = lgb.train(params, dtrain, num_boost_round=2000,
                       valid_sets=[dval],
-                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)])
+                      callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)])
 
     # --- RAM fix G: free training matrices right after model is trained ---
     del X_tr, X_vl, y_tr, y_vl, dtrain, dval
