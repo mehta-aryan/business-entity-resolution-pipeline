@@ -12,6 +12,7 @@ import os
 import sys
 import re
 import time
+import gc
 import argparse
 import pickle
 import warnings
@@ -660,30 +661,72 @@ def run_train(sample_frac=1.0):
     val_ids   = set(all_s1[split:])
     print(f"  Train S1: {len(train_ids):,}  Val S1: {len(val_ids):,}")
 
-    # Blocking (on all S1 for recall measurement)
+    # Blocking. NOTE: candidates are generated in CHUNKS of S1 and immediately
+    # reduced to (a) small running counters, (b) train/val pairs, before the
+    # chunk's raw candidate dict is discarded. The old code called
+    # blocker.transform(s1) ONCE on the full S1 set and kept the resulting
+    # dict-of-sets (hundreds of millions of entries at full scale) resident
+    # for the rest of run_train() -- that single object was almost certainly
+    # what pushed RSS past 128GB. This produces identical downstream data,
+    # bounded to O(CHUNK_SIZE * avg_candidates) at any moment instead of
+    # O(all_S1 * avg_candidates).
     blocker = Blocker(max_block=2000, tfidf_k=20)
     blocker.fit(s23)
-    cands = blocker.transform(s1)
 
-    # Blocking recall on validation
+    CHUNK_SIZE = 20_000
     hits = total = 0
-    for sid in val_ids:
-        for m in gt_dict.get(sid, set()):
-            total += 1
-            if m in cands.get(sid, set()):
-                hits += 1
+    total_cand_pairs = 0
+    tr_pairs, y_tr_parts = [], []
+    vl_pairs, y_vl_parts = [], []
+    val_all_pairs, val_gt_extra = [], []
+    rng_tr = np.random.RandomState(42)
+    rng_vl = np.random.RandomState(43)
+
+    n_s1 = len(s1)
+    print("\nGenerating candidates + building train/val pairs (streamed by chunk) ...")
+    for start in range(0, n_s1, CHUNK_SIZE):
+        end = min(start + CHUNK_SIZE, n_s1)
+        chunk_s1 = s1.iloc[start:end].reset_index(drop=True)
+        chunk_cands = blocker.transform(chunk_s1)
+
+        total_cand_pairs += sum(len(v) for v in chunk_cands.values())
+
+        chunk_ids = chunk_s1['entity_id'].values
+        chunk_train_ids = [sid for sid in chunk_ids if sid in train_ids]
+        chunk_val_ids   = [sid for sid in chunk_ids if sid in val_ids]
+
+        for sid in chunk_val_ids:
+            true = gt_dict.get(sid, set())
+            c = chunk_cands.get(sid, set())
+            for m in true:
+                total += 1
+                if m in c:
+                    hits += 1
+            for cid in c:
+                if cid in s23_lookup:
+                    val_all_pairs.append((sid, cid))
+            for m in true:
+                if m in s23_lookup and m not in c:
+                    val_gt_extra.append((sid, m))
+
+        p, y = make_pairs_and_labels(chunk_train_ids, chunk_cands, gt_dict, s23_lookup, neg_ratio=5, rng=rng_tr)
+        tr_pairs.extend(p); y_tr_parts.append(y)
+        p, y = make_pairs_and_labels(chunk_val_ids, chunk_cands, gt_dict, s23_lookup, neg_ratio=5, rng=rng_vl)
+        vl_pairs.extend(p); y_vl_parts.append(y)
+
+        del chunk_cands
+        gc.collect()
+        print(f"    {end:,}/{n_s1:,} S1 processed", flush=True)
+
+    y_tr = np.concatenate(y_tr_parts) if y_tr_parts else np.array([], dtype=np.int8)
+    y_vl = np.concatenate(y_vl_parts) if y_vl_parts else np.array([], dtype=np.int8)
+
     blocking_recall = hits / max(total, 1)
-    total_cand_pairs = sum(len(v) for v in cands.values())
     max_possible = len(s1) * len(s23)
     reduction = 1.0 - total_cand_pairs / max_possible
     print(f"\n  Blocking recall (val): {blocking_recall:.4f}  ({hits:,}/{total:,})")
     print(f"  Reduction ratio: {reduction:.8f}")
     print(f"  Candidate pairs: {total_cand_pairs:,}")
-
-    # Build training + validation pairs
-    print("\nBuilding train/val pairs ...")
-    tr_pairs, y_tr = make_pairs_and_labels(list(train_ids), cands, gt_dict, s23_lookup, neg_ratio=5)
-    vl_pairs, y_vl = make_pairs_and_labels(list(val_ids),   cands, gt_dict, s23_lookup, neg_ratio=5)
     print(f"  Train: {len(tr_pairs):,} pairs  (pos={y_tr.sum():,}, neg={len(y_tr)-y_tr.sum():,})")
     print(f"  Val:   {len(vl_pairs):,} pairs  (pos={y_vl.sum():,}, neg={len(y_vl)-y_vl.sum():,})")
 
@@ -723,20 +766,10 @@ def run_train(sample_frac=1.0):
         print(f"  {FEATURE_NAMES[idx]:30s}  {imp[idx]:.0f}")
 
     # ---- Threshold tuning on ALL validation candidates ----
-    print("\nScoring all validation candidates for threshold tuning ...")
-    val_all_pairs = []
-    for sid in val_ids:
-        for c in cands.get(sid, set()):
-            if c in s23_lookup:
-                val_all_pairs.append((sid, c))
-    
-    # Also include GT positives missed by blocking for comprehensive eval
-    val_gt_extra = []
-    for sid in val_ids:
-        for m in gt_dict.get(sid, set()):
-            if m in s23_lookup and m not in cands.get(sid, set()):
-                val_gt_extra.append((sid, m))
-    
+    # val_all_pairs / val_gt_extra were already built during the chunked
+    # candidate-generation loop above -- no need to touch a global cands
+    # dict here (it no longer exists, by design).
+    print("\nScoring validation candidates for threshold tuning ...")
     print(f"  Val candidate pairs: {len(val_all_pairs):,}")
     print(f"  Val GT pairs missed by blocking: {len(val_gt_extra):,}")
 
@@ -823,62 +856,65 @@ def run_test(sample_frac=1.0):
     s1_lookup  = build_lookup(s1)
     s23_lookup = build_lookup(s23)
 
-    # Blocking
+    # Blocking + scoring, streamed by S1 chunk. The old code called
+    # blocker.transform(s1) once on the full test set (cands: a dict of
+    # ~1.7M sets), then built all_pairs = [] as one list of every
+    # (s1_id, s23_id) pair before scoring anything -- both are O(all_S1) in
+    # memory and are what caused the OOM. This bounds peak memory to one
+    # chunk at a time and writes results as it goes instead of holding
+    # everything until the end.
     cfg = artefact['blocker_cfg']
     blocker = Blocker(**cfg)
     blocker.fit(s23)
-    cands = blocker.transform(s1)
 
-    # Score
-    print("\nScoring candidate pairs ...")
-    all_pairs = []
-    for sid in s1['entity_id'].values:
-        for c in cands.get(sid, set()):
-            all_pairs.append((sid, c))
-    print(f"  Total pairs: {len(all_pairs):,}")
-
-    matches_scored = defaultdict(list)
-    batch = 500_000
-    for start in range(0, len(all_pairs), batch):
-        end = min(start + batch, len(all_pairs))
-        chunk = all_pairs[start:end]
-        X, mask = featurize(chunk, s1_lookup, s23_lookup)
-        X = X[mask]
-        valid_chunk = [p for p, ok in zip(chunk, mask) if ok]
-        if len(X):
-            p = model.predict(X)
-            for i, (sid, cid) in enumerate(valid_chunk):
-                if p[i] >= thr:
-                    matches_scored[sid].append((p[i], cid))
-        if start % (batch * 3) == 0 and start:
-            print(f"    {start:,}/{len(all_pairs):,}", flush=True)
-
-    matches = defaultdict(set)
-    for sid, cands_list in matches_scored.items():
-        cands_list.sort(reverse=True, key=lambda x: x[0])
-        for _, cid in cands_list[:k_cap]:
-            matches[sid].add(cid)
-
-    # Write outputs
-    print("\nWriting outputs ...")
+    CHUNK_SIZE = 20_000
+    n_s1 = len(s1)
     mp = os.path.join(OUTPUT_DIR, 'matching_results.tsv')
     cp = os.path.join(OUTPUT_DIR, 'candidate_pairs.tsv')
+    n_matched = 0
+    n_links = 0
 
-    with open(mp, 'w', encoding='utf-8') as f:
-        f.write('source1_entity_id\tmatched_entity_ids\n')
-        for sid in s1['entity_id'].values:
-            m = ','.join(sorted(matches.get(sid, set())))
-            f.write(f'{sid}\t{m}\n')
+    print("\nScoring candidate pairs (streamed by S1 chunk) ...")
+    with open(mp, 'w', encoding='utf-8') as fm, open(cp, 'w', encoding='utf-8') as fc:
+        fm.write('source1_entity_id\tmatched_entity_ids\n')
+        fc.write('source1_entity_id\tcandidate_entity_ids\n')
 
-    with open(cp, 'w', encoding='utf-8') as f:
-        f.write('source1_entity_id\tcandidate_entity_ids\n')
-        for sid in s1['entity_id'].values:
-            c = ','.join(sorted(cands.get(sid, set())))
-            f.write(f'{sid}\t{c}\n')
+        for start in range(0, n_s1, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, n_s1)
+            chunk_s1 = s1.iloc[start:end].reset_index(drop=True)
+            chunk_ids = chunk_s1['entity_id'].values
 
-    n_matched = sum(1 for v in matches.values() if v)
-    n_links   = sum(len(v) for v in matches.values())
-    print(f"  Matched S1: {n_matched:,}  Links: {n_links:,}  Singletons: {len(s1)-n_matched:,}")
+            chunk_cands = blocker.transform(chunk_s1)
+            pairs = [(sid, c) for sid in chunk_ids for c in chunk_cands.get(sid, set())]
+
+            matches_scored = defaultdict(list)
+            if pairs:
+                X, mask = featurize(pairs, s1_lookup, s23_lookup)
+                X = X[mask]
+                valid_pairs = [p for p, ok in zip(pairs, mask) if ok]
+                if len(X):
+                    p = model.predict(X)
+                    for i, (sid, cid) in enumerate(valid_pairs):
+                        if p[i] >= thr:
+                            matches_scored[sid].append((p[i], cid))
+
+            for sid in chunk_ids:
+                cl = matches_scored.get(sid, [])
+                cl.sort(reverse=True, key=lambda x: x[0])
+                match_ids = sorted({cid for _, cid in cl[:k_cap]})
+                cand_ids = sorted(chunk_cands.get(sid, set()))
+
+                fm.write(f"{sid}\t{','.join(match_ids)}\n")
+                fc.write(f"{sid}\t{','.join(cand_ids)}\n")
+                if match_ids:
+                    n_matched += 1
+                    n_links += len(match_ids)
+
+            del chunk_cands, pairs, matches_scored
+            gc.collect()
+            print(f"    {end:,}/{n_s1:,} S1 processed", flush=True)
+
+    print(f"  Matched S1: {n_matched:,}  Links: {n_links:,}  Singletons: {n_s1-n_matched:,}")
     print(f"  Written: {mp}")
     print(f"  Written: {cp}")
 
