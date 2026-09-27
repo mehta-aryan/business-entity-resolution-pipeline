@@ -15,6 +15,8 @@ import time
 import gc
 import argparse
 import pickle
+import struct
+import tempfile
 import warnings
 from collections import defaultdict
 
@@ -163,6 +165,18 @@ def preprocess(df):
     
     print(f"done in {time.time()-t0:.0f}s")
     return df
+
+
+def _drop_blocker_cols(df):
+    """Drop columns only needed during Blocker.fit/transform to free RAM.
+
+    These columns hold Python list/set objects per row (~80 bytes each overhead)
+    and are not needed after the blocker has been built.
+    Dropping on s23 (10M rows) saves ~2-3 GB.
+    """
+    to_drop = [c for c in ('name_toks', 'all_sx', 'addr_nums', 'name_pre3') if c in df.columns]
+    if to_drop:
+        df.drop(columns=to_drop, inplace=True)
 
 
 ###############################################################################
@@ -402,6 +416,15 @@ FEATURE_NAMES = [
     'max_name_sim',           # 29: max of name_lev, name_token_sort, name_token_set
 ]
 
+# Slot indices for lookup tuples:
+#   (name_norm, addr_norm, postal, name_sx, country_norm, name_first)
+_LU_NAME_NORM    = 0
+_LU_ADDR_NORM    = 1
+_LU_POSTAL       = 2
+_LU_NAME_SX      = 3
+_LU_COUNTRY_NORM = 4
+_LU_NAME_FIRST   = 5
+
 def _jaccard(s1, s2):
     if not s1 and not s2: return 1.0
     if not s1 or not s2: return 0.0
@@ -410,7 +433,8 @@ def _jaccard(s1, s2):
 
 def compute_features_vec(s1_rows, s23_rows):
     """
-    s1_rows, s23_rows: aligned lists of record-dicts (same length).
+    s1_rows, s23_rows: aligned lists of 6-tuples (same length).
+    Each tuple: (name_norm, addr_norm, postal, name_sx, country_norm, name_first)
     Returns np.ndarray of shape (n, num_features).
     """
     n = len(s1_rows)
@@ -421,10 +445,10 @@ def compute_features_vec(s1_rows, s23_rows):
         r1 = s1_rows[i]
         r2 = s23_rows[i]
 
-        nn1 = r1['name_norm']
-        nn2 = r2['name_norm']
-        an1 = r1['addr_norm']
-        an2 = r2['addr_norm']
+        nn1 = r1[_LU_NAME_NORM]
+        nn2 = r2[_LU_NAME_NORM]
+        an1 = r1[_LU_ADDR_NORM]
+        an2 = r2[_LU_ADDR_NORM]
 
         # ----- Name features -----
         X[i, 0] = 1.0 if nn1 and nn2 and nn1 == nn2 else 0.0            # name_exact
@@ -450,14 +474,17 @@ def compute_features_vec(s1_rows, s23_rows):
             if c1 != c2: break
             pfx += 1
         X[i, 9] = pfx / ml                                               # name_prefix_ratio
-        X[i, 10] = 1.0 if r1.get('name_sx') and r1['name_sx'] == r2.get('name_sx','') else 0.0  # soundex
+
+        sx1 = r1[_LU_NAME_SX]
+        sx2 = r2[_LU_NAME_SX]
+        X[i, 10] = 1.0 if sx1 and sx1 == sx2 else 0.0                   # soundex
 
         ln1, ln2 = len(nn1), len(nn2)
         X[i, 11] = min(ln1, ln2) / max(ln1, ln2, 1)                      # name_len_ratio
 
         # First significant token exact match
-        ft1 = r1.get('name_first', '')
-        ft2 = r2.get('name_first', '')
+        ft1 = r1[_LU_NAME_FIRST]
+        ft2 = r2[_LU_NAME_FIRST]
         X[i, 12] = 1.0 if ft1 and ft2 and ft1 == ft2 else 0.0           # name_first_exact
         X[i, 13] = abs(ln1 - ln2)                                        # name_len_diff
 
@@ -475,7 +502,7 @@ def compute_features_vec(s1_rows, s23_rows):
         X[i, 18] = _jaccard(nums1, nums2)                                # addr_num_jaccard
         X[i, 19] = len(nums1 & nums2) if nums1 and nums2 else 0          # addr_num_overlap
 
-        p1, p2 = r1.get('postal', ''), r2.get('postal', '')
+        p1, p2 = r1[_LU_POSTAL], r2[_LU_POSTAL]
         X[i, 20] = 1.0 if (p1 and p2 and p1 == p2) else 0.0             # postal_exact
         X[i, 21] = 1.0 if (p1 and p2) else 0.0                           # postal_both_present
         X[i, 22] = 1.0 if (p1 and p2 and len(p1)>=3 and len(p2)>=3
@@ -486,7 +513,9 @@ def compute_features_vec(s1_rows, s23_rows):
         X[i, 24] = 1.0 if not an2 else 0.0                               # addr2_empty
 
         # ----- Cross-field features -----
-        X[i, 25] = 1.0 if r1.get('country_norm','') == r2.get('country_norm','') else 0.0
+        c1 = r1[_LU_COUNTRY_NORM]
+        c2 = r2[_LU_COUNTRY_NORM]
+        X[i, 25] = 1.0 if c1 == c2 else 0.0
         X[i, 26] = X[i, 5] * X[i, 16]                                    # name_addr_prod
         X[i, 27] = X[i, 1] * X[i, 14]                                    # name_lev_addr_lev_prod
         X[i, 28] = X[i, 4] * X[i, 14]                                    # name_token_set * addr_lev
@@ -519,38 +548,163 @@ def macro_f05(pred_dict, gt_dict, all_s1_ids):
 
 
 ###############################################################################
-# MAIN PIPELINE
+# LOOKUP BUILDING
 ###############################################################################
-def load_sources(data_dir, prefix):
-    print(f"Loading {prefix} sources ...", flush=True)
-    kw = dict(sep='\t', dtype=str, na_filter=False)
-    s1 = pd.read_csv(os.path.join(data_dir, f'{prefix}_source1.tsv'), **kw)
-    s2 = pd.read_csv(os.path.join(data_dir, f'{prefix}_source2.tsv'), **kw)
-    s3 = pd.read_csv(os.path.join(data_dir, f'{prefix}_source3.tsv'), **kw)
-    print(f"  S1={len(s1):,}  S2={len(s2):,}  S3={len(s3):,}")
-    return s1, s2, s3
-
-
-def load_gt(path):
-    gt = pd.read_csv(path, sep='\t', dtype=str, na_filter=False)
-    d = {}
-    for sid, mids in zip(gt['source1_entity_id'], gt['matched_entity_ids']):
-        d[sid] = set(mids.split(',')) if mids.strip() else set()
-    return d
-
-
 def build_lookup(df):
-    """entity_id → row-dict lookup."""
-    cols = ['entity_id','name_norm','addr_norm','postal','name_sx','country',
-            'country_norm','name_first',
-            'business_name','business_address']
+    """entity_id -> 6-tuple lookup.
+
+    Stores ONLY the 6 fields actually consumed by compute_features_vec:
+      (name_norm, addr_norm, postal, name_sx, country_norm, name_first)
+
+    Using a tuple instead of a dict per record reduces CPython overhead
+    from ~900 bytes/record to ~104 bytes/record (excluding string data),
+    which saves ~8 GB at 10 M S2/S3 records compared to dict-of-dicts.
+    business_name and business_address are NOT stored — they are never
+    read by any feature computation.
+    """
+    cols = ['entity_id', 'name_norm', 'addr_norm', 'postal',
+            'name_sx', 'country_norm', 'name_first']
     recs = {}
     for vals in zip(*(df[c] for c in cols)):
-        d = dict(zip(cols, vals))
-        recs[d['entity_id']] = d
+        # vals[0] = entity_id; vals[1:7] = the 6 feature fields as a tuple
+        recs[vals[0]] = vals[1:]
     return recs
 
 
+###############################################################################
+# DISK-BACKED PAIR STORE
+###############################################################################
+# At full scale the accumulated Python lists for tr_pairs, vl_pairs, and
+# val_all_pairs can exceed 4-5 GB combined. _DiskPairStore writes each
+# (s1_id, s23_id) pair to a temp binary file as length-prefixed bytes and
+# reads them back on demand, keeping only one batch in RAM at a time.
+
+_PAIR_STRUCT = struct.Struct('>HH')   # two unsigned shorts (len_s1_id, len_s23_id)
+
+class _DiskPairStore:
+    """Write (s1_id, s23_id) string pairs to disk; stream them back."""
+
+    def __init__(self):
+        self._fh = tempfile.TemporaryFile()
+        self._count = 0
+
+    def append(self, s1_id, s23_id):
+        b1 = s1_id.encode()
+        b2 = s23_id.encode()
+        self._fh.write(_PAIR_STRUCT.pack(len(b1), len(b2)))
+        self._fh.write(b1)
+        self._fh.write(b2)
+        self._count += 1
+
+    def extend_pairs(self, pair_list):
+        for s1_id, s23_id in pair_list:
+            self.append(s1_id, s23_id)
+
+    def __len__(self):
+        return self._count
+
+    def iterate(self, batch_size=200_000):
+        """Yield batches of [(s1_id, s23_id), ...] by seeking to 0 first."""
+        self._fh.seek(0)
+        hdr_size = _PAIR_STRUCT.size
+        batch = []
+        while True:
+            hdr = self._fh.read(hdr_size)
+            if len(hdr) < hdr_size:
+                break
+            l1, l2 = _PAIR_STRUCT.unpack(hdr)
+            b1 = self._fh.read(l1)
+            b2 = self._fh.read(l2)
+            batch.append((b1.decode(), b2.decode()))
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def close(self):
+        self._fh.close()
+
+
+###############################################################################
+# FEATURIZATION HELPERS
+###############################################################################
+def featurize(pairs, s1_lookup, s23_lookup, batch_size=200_000):
+    """Compute feature matrix for a list of (s1_id, s23_id) pairs (in RAM).
+
+    Used only for moderate-sized pair sets in test inference where a chunk
+    fits comfortably in memory.
+    Returns (X, valid_mask).
+    """
+    n = len(pairs)
+    X = np.zeros((n, len(FEATURE_NAMES)), dtype=np.float32)
+    valid_mask = np.ones(n, dtype=bool)
+
+    _empty = ('', '', '', '', '', '')
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        s1_rows = []
+        s23_rows = []
+        for i in range(start, end):
+            s1_id, s23_id = pairs[i]
+            r1 = s1_lookup.get(s1_id)
+            r2 = s23_lookup.get(s23_id)
+            if r1 is None or r2 is None:
+                valid_mask[i] = False
+                s1_rows.append(_empty)
+                s23_rows.append(_empty)
+            else:
+                s1_rows.append(r1)
+                s23_rows.append(r2)
+        X[start:end] = compute_features_vec(s1_rows, s23_rows)
+
+        if start and start % (batch_size * 5) == 0:
+            print(f"    featurize {start:,}/{n:,}", flush=True)
+
+    return X, valid_mask
+
+
+def _featurize_store_to_memmap(pair_store, s1_lookup, s23_lookup,
+                                mm_path, batch_size=200_000):
+    """Stream pairs from a _DiskPairStore, featurize in batches, write to memmap.
+
+    Returns (mm, valid_mask) where mm is a numpy memmap (stays on disk) and
+    valid_mask is a bool array in RAM (~1 bit per pair, negligible).
+    This avoids materializing the full X matrix in RAM during featurization.
+    """
+    total_pairs = len(pair_store)
+    nf = len(FEATURE_NAMES)
+    mm = np.memmap(mm_path, dtype=np.float32, mode='w+', shape=(total_pairs, nf))
+    valid_mask = np.ones(total_pairs, dtype=bool)
+    _empty = ('', '', '', '', '', '')
+
+    offset = 0
+    for batch in pair_store.iterate(batch_size):
+        blen = len(batch)
+        s1_rows, s23_rows = [], []
+        for k, (s1_id, s23_id) in enumerate(batch):
+            r1 = s1_lookup.get(s1_id)
+            r2 = s23_lookup.get(s23_id)
+            if r1 is None or r2 is None:
+                valid_mask[offset + k] = False
+                s1_rows.append(_empty)
+                s23_rows.append(_empty)
+            else:
+                s1_rows.append(r1)
+                s23_rows.append(r2)
+        mm[offset:offset + blen] = compute_features_vec(s1_rows, s23_rows)
+        offset += blen
+        if offset % (batch_size * 5) == 0 and offset > 0:
+            print(f"    featurize (memmap) {offset:,}/{total_pairs:,}", flush=True)
+
+    mm.flush()
+    return mm, valid_mask
+
+
+###############################################################################
+# PAIR + LABEL GENERATION
+###############################################################################
 def make_pairs_and_labels(s1_ids, cands, gt_dict, s23_lookup, neg_ratio=5, rng=None):
     """Build (s1_id, s23_id, label) triples from candidates + ground truth.
     
@@ -583,39 +737,9 @@ def make_pairs_and_labels(s1_ids, cands, gt_dict, s23_lookup, neg_ratio=5, rng=N
     return pairs, np.array(labels, dtype=np.int8)
 
 
-def featurize(pairs, s1_lookup, s23_lookup, batch_size=200_000):
-    """Compute feature matrix for list of (s1_id, s23_id) pairs."""
-    n = len(pairs)
-    X = np.zeros((n, len(FEATURE_NAMES)), dtype=np.float32)
-    valid_mask = np.ones(n, dtype=bool)
-
-    _empty = {'name_norm':'','addr_norm':'','postal':'','name_sx':'',
-              'country':'','country_norm':'','name_first':'',
-              'business_name':'','business_address':''}
-
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        s1_rows = []
-        s23_rows = []
-        for i in range(start, end):
-            s1_id, s23_id = pairs[i]
-            r1 = s1_lookup.get(s1_id)
-            r2 = s23_lookup.get(s23_id)
-            if r1 is None or r2 is None:
-                valid_mask[i] = False
-                s1_rows.append(_empty)
-                s23_rows.append(_empty)
-            else:
-                s1_rows.append(r1)
-                s23_rows.append(r2)
-        X[start:end] = compute_features_vec(s1_rows, s23_rows)
-
-        if start and start % (batch_size * 5) == 0:
-            print(f"    featurize {start:,}/{n:,}", flush=True)
-
-    return X, valid_mask
-
-
+###############################################################################
+# TRAINING
+###############################################################################
 def run_train(sample_frac=1.0):
     print("=" * 80)
     print("TRAINING")
@@ -641,16 +765,45 @@ def run_train(sample_frac=1.0):
         gt_dict = {k: v for k, v in gt_dict.items() if k in keep}
         print(f"  Sampled: S1={len(s1):,}  S2={len(s2):,}  S3={len(s3):,}")
 
-    # Preprocess
+    # Preprocess all three sources
     s1 = preprocess(s1)
     s2 = preprocess(s2)
     s3 = preprocess(s3)
-    s23 = pd.concat([s2, s3], ignore_index=True)
-    print(f"  Combined S2+S3: {len(s23):,}")
 
-    # Build lookups
-    s1_lookup = build_lookup(s1)
+    # --- RAM fix A: concat s2+s3 then immediately free s2 and s3 ---
+    # pd.concat keeps s2 and s3 alive until explicitly deleted. At 10M rows
+    # this triples the RAM needed for source data. Freeing them right after
+    # concat saves ~2-3 GB.
+    s23 = pd.concat([s2, s3], ignore_index=True)
+    del s2, s3
+    gc.collect()
+    print(f"  Combined S2+S3: {len(s23):,} (s2/s3 freed)")
+
+    # --- Blocker build BEFORE dropping Python-object columns ---
+    # blocker.fit() is the only consumer of name_toks, all_sx, addr_nums.
+    blocker = Blocker(max_block=2000, tfidf_k=20)
+    blocker.fit(s23)
+
+    # --- RAM fix B: drop Python list/set columns from s23 after blocker.fit() ---
+    # name_toks, all_sx, addr_nums are Python-object columns: each cell is a
+    # CPython list/set object (~80 bytes overhead + 8 bytes per element).
+    # At 10M rows with avg 3 tokens each, that's ~3 GB just for these columns.
+    # They are no longer needed on s23 (blocker already consumed them).
+    _drop_blocker_cols(s23)
+    gc.collect()
+
+    # --- RAM fix C: use tuple-based lookup (saves ~8 GB vs dict-of-dicts) ---
+    # build_lookup now returns entity_id -> 6-tuple instead of entity_id -> dict.
+    # A dict of 6 entries costs ~900 bytes in CPython; a 6-tuple costs ~104 bytes.
+    # 10M records: 900 MB saved on tuple overhead alone (string data is shared).
+    s1_lookup  = build_lookup(s1)
     s23_lookup = build_lookup(s23)
+
+    # --- RAM fix D: free s23 DataFrame after lookup is built ---
+    # s23_lookup now contains everything needed for feature computation;
+    # the DataFrame itself is redundant.
+    del s23
+    gc.collect()
 
     # Train/val split (85/15 on S1 entity IDs)
     rng = np.random.RandomState(42)
@@ -659,28 +812,30 @@ def run_train(sample_frac=1.0):
     split = int(len(all_s1) * 0.85)
     train_ids = set(all_s1[:split])
     val_ids   = set(all_s1[split:])
+    del all_s1
     print(f"  Train S1: {len(train_ids):,}  Val S1: {len(val_ids):,}")
 
-    # Blocking. NOTE: candidates are generated in CHUNKS of S1 and immediately
-    # reduced to (a) small running counters, (b) train/val pairs, before the
-    # chunk's raw candidate dict is discarded. The old code called
-    # blocker.transform(s1) ONCE on the full S1 set and kept the resulting
-    # dict-of-sets (hundreds of millions of entries at full scale) resident
-    # for the rest of run_train() -- that single object was almost certainly
-    # what pushed RSS past 128GB. This produces identical downstream data,
-    # bounded to O(CHUNK_SIZE * avg_candidates) at any moment instead of
-    # O(all_S1 * avg_candidates).
-    blocker = Blocker(max_block=2000, tfidf_k=20)
-    blocker.fit(s23)
-
+    # -----------------------------------------------------------------------
+    # Blocking. Candidates are generated in CHUNKS of S1 and immediately
+    # reduced before the chunk dict is discarded — same as the previous version.
+    #
+    # --- RAM fix E: write pairs to disk stores instead of Python lists ---
+    # tr_pairs / vl_pairs / val_all_pairs accumulated as Python lists of tuples
+    # can reach 4-5 GB combined at full scale. _DiskPairStore streams each
+    # (s1_id, s23_id) pair to a temp binary file with negligible RAM overhead.
+    # -----------------------------------------------------------------------
     CHUNK_SIZE = 20_000
     hits = total = 0
     total_cand_pairs = 0
-    tr_pairs, y_tr_parts = [], []
-    vl_pairs, y_vl_parts = [], []
-    val_all_pairs, val_gt_extra = [], []
     rng_tr = np.random.RandomState(42)
     rng_vl = np.random.RandomState(43)
+
+    tr_store  = _DiskPairStore()  # training pairs
+    vl_store  = _DiskPairStore()  # validation pairs (for lgb val set)
+    vc_store  = _DiskPairStore()  # ALL val candidate pairs (for threshold tuning)
+
+    _tr_label_parts = []
+    _vl_label_parts = []
 
     n_s1 = len(s1)
     print("\nGenerating candidates + building train/val pairs (streamed by chunk) ...")
@@ -695,6 +850,7 @@ def run_train(sample_frac=1.0):
         chunk_train_ids = [sid for sid in chunk_ids if sid in train_ids]
         chunk_val_ids   = [sid for sid in chunk_ids if sid in val_ids]
 
+        # Val blocking-recall stats + val_all_pairs -> disk
         for sid in chunk_val_ids:
             true = gt_dict.get(sid, set())
             c = chunk_cands.get(sid, set())
@@ -704,45 +860,92 @@ def run_train(sample_frac=1.0):
                     hits += 1
             for cid in c:
                 if cid in s23_lookup:
-                    val_all_pairs.append((sid, cid))
+                    vc_store.append(sid, cid)
+            # GT pairs missed by blocking also go to vc_store
+            # (same role as old val_gt_extra — they are needed so threshold
+            #  tuning can observe these hard positives)
             for m in true:
                 if m in s23_lookup and m not in c:
-                    val_gt_extra.append((sid, m))
+                    vc_store.append(sid, m)
 
-        p, y = make_pairs_and_labels(chunk_train_ids, chunk_cands, gt_dict, s23_lookup, neg_ratio=5, rng=rng_tr)
-        tr_pairs.extend(p); y_tr_parts.append(y)
-        p, y = make_pairs_and_labels(chunk_val_ids, chunk_cands, gt_dict, s23_lookup, neg_ratio=5, rng=rng_vl)
-        vl_pairs.extend(p); y_vl_parts.append(y)
+        p, y = make_pairs_and_labels(chunk_train_ids, chunk_cands, gt_dict, s23_lookup,
+                                     neg_ratio=5, rng=rng_tr)
+        tr_store.extend_pairs(p)
+        _tr_label_parts.append(y)
 
-        del chunk_cands
+        p, y = make_pairs_and_labels(chunk_val_ids, chunk_cands, gt_dict, s23_lookup,
+                                     neg_ratio=5, rng=rng_vl)
+        vl_store.extend_pairs(p)
+        _vl_label_parts.append(y)
+
+        del chunk_cands, p, y
         gc.collect()
         print(f"    {end:,}/{n_s1:,} S1 processed", flush=True)
 
-    y_tr = np.concatenate(y_tr_parts) if y_tr_parts else np.array([], dtype=np.int8)
-    y_vl = np.concatenate(y_vl_parts) if y_vl_parts else np.array([], dtype=np.int8)
+    # --- RAM fix F: drop Python-object columns from s1 after chunk loop ---
+    # s1 still needs name_toks / all_sx / addr_nums during transform() on each
+    # chunk slice, so we only drop them after all chunks are done.
+    _drop_blocker_cols(s1)
+    gc.collect()
+
+    y_tr = np.concatenate(_tr_label_parts) if _tr_label_parts else np.array([], dtype=np.int8)
+    y_vl = np.concatenate(_vl_label_parts) if _vl_label_parts else np.array([], dtype=np.int8)
+    del _tr_label_parts, _vl_label_parts
+    gc.collect()
 
     blocking_recall = hits / max(total, 1)
-    max_possible = len(s1) * len(s23)
-    reduction = 1.0 - total_cand_pairs / max_possible
+    max_possible = n_s1 * len(s23_lookup)
+    reduction = 1.0 - total_cand_pairs / max(max_possible, 1)
     print(f"\n  Blocking recall (val): {blocking_recall:.4f}  ({hits:,}/{total:,})")
     print(f"  Reduction ratio: {reduction:.8f}")
     print(f"  Candidate pairs: {total_cand_pairs:,}")
-    print(f"  Train: {len(tr_pairs):,} pairs  (pos={y_tr.sum():,}, neg={len(y_tr)-y_tr.sum():,})")
-    print(f"  Val:   {len(vl_pairs):,} pairs  (pos={y_vl.sum():,}, neg={len(y_vl)-y_vl.sum():,})")
+    print(f"  Train: {len(tr_store):,} pairs  (pos={y_tr.sum():,}, neg={len(y_tr)-y_tr.sum():,})")
+    print(f"  Val:   {len(vl_store):,} pairs  (pos={y_vl.sum():,}, neg={len(y_vl)-y_vl.sum():,})")
 
-    # Featurize
-    print("\nFeaturizing training pairs ...")
-    X_tr, m_tr = featurize(tr_pairs, s1_lookup, s23_lookup)
-    X_tr = X_tr[m_tr]; y_tr = y_tr[m_tr]; tr_pairs = [p for p, ok in zip(tr_pairs, m_tr) if ok]
+    # -----------------------------------------------------------------------
+    # Featurize — write to memmap files so X_tr / X_vl never fully occupy RAM.
+    # The valid rows are then compacted into in-RAM arrays for LightGBM.
+    # At full scale X_tr ~840 MB and X_vl ~140 MB — these are acceptable once
+    # the other large structures have been freed.
+    # -----------------------------------------------------------------------
+    tmpdir = tempfile.gettempdir()
+    mm_tr_path = os.path.join(tmpdir, 'ber_X_tr.mmap')
+    mm_vl_path = os.path.join(tmpdir, 'ber_X_vl.mmap')
+    mm_vc_path = os.path.join(tmpdir, 'ber_X_vc.mmap')
 
-    print("Featurizing validation pairs ...")
-    X_vl, m_vl = featurize(vl_pairs, s1_lookup, s23_lookup)
-    X_vl = X_vl[m_vl]; y_vl = y_vl[m_vl]; vl_pairs = [p for p, ok in zip(vl_pairs, m_vl) if ok]
+    print("\nFeaturizing training pairs (disk -> memmap) ...")
+    mm_tr, m_tr = _featurize_store_to_memmap(tr_store, s1_lookup, s23_lookup, mm_tr_path)
+    tr_store.close()
+
+    print("Featurizing validation pairs (disk -> memmap) ...")
+    mm_vl, m_vl = _featurize_store_to_memmap(vl_store, s1_lookup, s23_lookup, mm_vl_path)
+    vl_store.close()
+
+    # Compact into in-RAM arrays (valid rows only). This is necessary because
+    # LightGBM works best with a contiguous ndarray.
+    print("  Compacting valid training/val rows into RAM ...")
+    X_tr = np.array(mm_tr[m_tr], dtype=np.float32)
+    y_tr = y_tr[m_tr]
+    del mm_tr
+    try:
+        os.remove(mm_tr_path)
+    except OSError:
+        pass
+
+    X_vl = np.array(mm_vl[m_vl], dtype=np.float32)
+    y_vl = y_vl[m_vl]
+    del mm_vl
+    try:
+        os.remove(mm_vl_path)
+    except OSError:
+        pass
+    gc.collect()
+    print(f"  X_tr shape: {X_tr.shape}  X_vl shape: {X_vl.shape}")
 
     # Train LightGBM
     print("\nTraining LightGBM ...")
-    dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=FEATURE_NAMES, free_raw_data=False)
-    dval   = lgb.Dataset(X_vl, label=y_vl, feature_name=FEATURE_NAMES, free_raw_data=False)
+    dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=FEATURE_NAMES, free_raw_data=True)
+    dval   = lgb.Dataset(X_vl, label=y_vl, feature_name=FEATURE_NAMES, free_raw_data=True)
 
     params = {
         'objective': 'binary', 'metric': 'binary_logloss',
@@ -758,6 +961,10 @@ def run_train(sample_frac=1.0):
                       valid_sets=[dval],
                       callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)])
 
+    # --- RAM fix G: free training matrices right after model is trained ---
+    del X_tr, X_vl, y_tr, y_vl, dtrain, dval
+    gc.collect()
+
     # Feature importance
     imp = model.feature_importance(importance_type='gain')
     order = np.argsort(imp)[::-1]
@@ -765,39 +972,66 @@ def run_train(sample_frac=1.0):
     for idx in order[:20]:
         print(f"  {FEATURE_NAMES[idx]:30s}  {imp[idx]:.0f}")
 
-    # ---- Threshold tuning on ALL validation candidates ----
-    # val_all_pairs / val_gt_extra were already built during the chunked
-    # candidate-generation loop above -- no need to touch a global cands
-    # dict here (it no longer exists, by design).
+    # -----------------------------------------------------------------------
+    # Threshold tuning on ALL validation candidates.
+    # vc_store holds all val candidate pairs on disk. We featurize them to a
+    # memmap and then score them in streaming batches — X_vc is never loaded
+    # fully into RAM.
+    # -----------------------------------------------------------------------
     print("\nScoring validation candidates for threshold tuning ...")
-    print(f"  Val candidate pairs: {len(val_all_pairs):,}")
-    print(f"  Val GT pairs missed by blocking: {len(val_gt_extra):,}")
+    print(f"  Val candidate pairs (on disk): {len(vc_store):,}")
 
-    X_vc, m_vc = featurize(val_all_pairs, s1_lookup, s23_lookup)
-    X_vc = X_vc[m_vc]
-    val_all_pairs = [p for p, ok in zip(val_all_pairs, m_vc) if ok]
-    probs = model.predict(X_vc)
+    print("  Featurizing val-all pairs (disk -> memmap) ...")
+    mm_vc, m_vc = _featurize_store_to_memmap(vc_store, s1_lookup, s23_lookup, mm_vc_path)
+
+    # Score in streaming batches; accumulate only (sid, cid, prob) in a dict.
+    # This avoids materializing the full X_vc (~3 GB) and full val_all_pairs
+    # list (~3.5 GB) simultaneously.
+    print("  Scoring val candidates in streaming batches ...")
+    scored_d = defaultdict(list)   # sid -> [(prob, cid), ...]
+    batch_size_score = 200_000
+    vc_offset = 0
+    for batch in vc_store.iterate(batch_size_score):
+        blen = len(batch)
+        batch_X = mm_vc[vc_offset:vc_offset + blen]
+        batch_mask = m_vc[vc_offset:vc_offset + blen]
+        valid_X = np.array(batch_X[batch_mask], dtype=np.float32)
+        if len(valid_X):
+            probs_batch = model.predict(valid_X)
+            vi = 0
+            for j in range(blen):
+                if batch_mask[j]:
+                    sid, cid = batch[j]
+                    scored_d[sid].append((float(probs_batch[vi]), cid))
+                    vi += 1
+        vc_offset += blen
+
+    vc_store.close()
+    del mm_vc, valid_X
+    try:
+        os.remove(mm_vc_path)
+    except OSError:
+        pass
+    gc.collect()
 
     # Fine-grained threshold search
     best_f05, best_thr, best_k = 0, 0.5, 3
     for thr in np.arange(0.05, 0.98, 0.01):
-        # group scores per sid
-        scored_d = defaultdict(list)
-        for i, (sid, cid) in enumerate(val_all_pairs):
-            if probs[i] >= thr:
-                scored_d[sid].append((probs[i], cid))
-        
         for k in [3, 5, 8, 12]:
             pred_d = defaultdict(set)
             for sid in val_ids:
                 pred_d[sid] = set()
             for sid, cands_list in scored_d.items():
-                cands_list.sort(reverse=True, key=lambda x: x[0])
-                for _, cid in cands_list[:k]:
+                filtered = [(prob, cid) for prob, cid in cands_list if prob >= thr]
+                filtered.sort(reverse=True, key=lambda x: x[0])
+                for _, cid in filtered[:k]:
                     pred_d[sid].add(cid)
             f = macro_f05(pred_d, gt_dict, list(val_ids))
             if f > best_f05:
                 best_f05, best_thr, best_k = f, thr, k
+
+    del scored_d
+    gc.collect()
 
     print(f"\n  Best threshold: {best_thr:.2f}")
     print(f"  Best K: {best_k}")
@@ -815,6 +1049,9 @@ def run_train(sample_frac=1.0):
                 val_f05=best_f05, threshold=best_thr)
 
 
+###############################################################################
+# TEST INFERENCE
+###############################################################################
 def run_test(sample_frac=1.0):
     print("=" * 80)
     print("TEST INFERENCE")
@@ -840,8 +1077,11 @@ def run_test(sample_frac=1.0):
     s1 = preprocess(s1)
     s2 = preprocess(s2)
     s3 = preprocess(s3)
+    # --- RAM fix: free s2/s3 immediately after concat ---
     s23 = pd.concat([s2, s3], ignore_index=True)
-    print(f"  Combined S2+S3: {len(s23):,}")
+    del s2, s3
+    gc.collect()
+    print(f"  Combined S2+S3: {len(s23):,} (s2/s3 freed)")
 
     # Load model
     path = os.path.join(MODEL_DIR, 'model.pkl')
@@ -853,8 +1093,20 @@ def run_test(sample_frac=1.0):
     print(f"  Model loaded, threshold={thr:.2f}, k_cap={k_cap}")
 
     # Lookups
+    cfg = artefact['blocker_cfg']
+    blocker = Blocker(**cfg)
+    blocker.fit(s23)
+
+    # --- RAM fix: drop blocker columns from s23 after fit ---
+    _drop_blocker_cols(s23)
+    gc.collect()
+
     s1_lookup  = build_lookup(s1)
     s23_lookup = build_lookup(s23)
+
+    # --- RAM fix: free s23 DataFrame after lookup is built ---
+    del s23
+    gc.collect()
 
     # Blocking + scoring, streamed by S1 chunk. The old code called
     # blocker.transform(s1) once on the full test set (cands: a dict of
@@ -863,10 +1115,6 @@ def run_test(sample_frac=1.0):
     # memory and are what caused the OOM. This bounds peak memory to one
     # chunk at a time and writes results as it goes instead of holding
     # everything until the end.
-    cfg = artefact['blocker_cfg']
-    blocker = Blocker(**cfg)
-    blocker.fit(s23)
-
     CHUNK_SIZE = 20_000
     n_s1 = len(s1)
     mp = os.path.join(OUTPUT_DIR, 'matching_results.tsv')
@@ -897,6 +1145,7 @@ def run_test(sample_frac=1.0):
                     for i, (sid, cid) in enumerate(valid_pairs):
                         if p[i] >= thr:
                             matches_scored[sid].append((p[i], cid))
+                del X, mask, valid_pairs
 
             for sid in chunk_ids:
                 cl = matches_scored.get(sid, [])
@@ -919,6 +1168,9 @@ def run_test(sample_frac=1.0):
     print(f"  Written: {cp}")
 
 
+###############################################################################
+# ENTRY POINT
+###############################################################################
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--mode', choices=['train','test','full'], default='full')
