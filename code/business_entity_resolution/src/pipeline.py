@@ -548,6 +548,27 @@ def macro_f05(pred_dict, gt_dict, all_s1_ids):
 
 
 ###############################################################################
+# DATA LOADING
+###############################################################################
+def load_sources(data_dir, prefix):
+    print(f"Loading {prefix} sources ...", flush=True)
+    kw = dict(sep='\t', dtype=str, na_filter=False)
+    s1 = pd.read_csv(os.path.join(data_dir, f'{prefix}_source1.tsv'), **kw)
+    s2 = pd.read_csv(os.path.join(data_dir, f'{prefix}_source2.tsv'), **kw)
+    s3 = pd.read_csv(os.path.join(data_dir, f'{prefix}_source3.tsv'), **kw)
+    print(f"  S1={len(s1):,}  S2={len(s2):,}  S3={len(s3):,}")
+    return s1, s2, s3
+
+
+def load_gt(path):
+    gt = pd.read_csv(path, sep='\t', dtype=str, na_filter=False)
+    d = {}
+    for sid, mids in zip(gt['source1_entity_id'], gt['matched_entity_ids']):
+        d[sid] = set(mids.split(',')) if mids.strip() else set()
+    return d
+
+
+###############################################################################
 # LOOKUP BUILDING
 ###############################################################################
 def build_lookup(df):
